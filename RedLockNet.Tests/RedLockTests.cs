@@ -2,7 +2,7 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Net;
-using System.Reflection;
+using System.Security.Authentication;
 using System.Threading;
 using System.Threading.Tasks;
 using JetBrains.Annotations;
@@ -26,7 +26,11 @@ namespace RedLockNet.Tests
 		{
 			ThreadPool.SetMinThreads(100, 100);
 
-			loggerFactory = new LoggerFactory().AddConsole(LogLevel.Debug);
+			loggerFactory = LoggerFactory.Create(b => b.AddSimpleConsole(opts =>
+			{
+				opts.TimestampFormat = "HH:mm:ss.ffff ";
+				opts.SingleLine = true;
+			}).SetMinimumLevel(LogLevel.Debug));
 			logger = loggerFactory.CreateLogger<RedLockTests>();
 		}
 
@@ -102,6 +106,14 @@ namespace RedLockNet.Tests
 		}
 
 		[Test]
+		public async Task TestSingleLockAsync()
+		{
+			await CheckSingleRedisLockAsync(
+				() => RedLockFactory.Create(SomeActiveEndPointsWithQuorum, loggerFactory),
+				RedLockStatus.Acquired);
+		}
+
+		[Test]
 		public void TestOverlappingLocks()
 		{
 			using (var redisLockFactory = RedLockFactory.Create(AllActiveEndPoints, loggerFactory))
@@ -137,11 +149,11 @@ namespace RedLockNet.Tests
 			{
 				var resource = $"testredislock:{Guid.NewGuid()}";
 
-				using (var firstLock = await redisLockFactory.CreateLockAsync(resource, TimeSpan.FromSeconds(30)))
+				await using (var firstLock = await redisLockFactory.CreateLockAsync(resource, TimeSpan.FromSeconds(30)))
 				{
 					Assert.That(firstLock.IsAcquired, Is.True);
 
-					using (var secondLock = await redisLockFactory.CreateLockAsync(resource, TimeSpan.FromSeconds(30)))
+					await using (var secondLock = await redisLockFactory.CreateLockAsync(resource, TimeSpan.FromSeconds(30)))
 					{
 						Assert.That(secondLock.IsAcquired, Is.False);
 						Assert.That(secondLock.Status, Is.EqualTo(RedLockStatus.Conflicted));
@@ -235,6 +247,47 @@ namespace RedLockNet.Tests
 
 				Assert.That(extendCount, Is.GreaterThan(2));
 			}
+		}
+
+		[Test]
+		public async Task TestContendedExtendCancellation()
+		{
+			using (var redisLockFactory = RedLockFactory.Create(new List<RedLockEndPoint> { ActiveServer1 }, loggerFactory))
+			{
+				var resource = $"testcontendedlock:{Guid.NewGuid()}";
+
+				var tasks = new List<Task>();
+
+				tasks.Add(Task.Run(() => ContendedSleep(redisLockFactory, resource, 1, TimeSpan.FromSeconds(2))));
+
+				// sleep for just shorter than the duration of the previous lock, so that the second lock should fail to be acquired on the first attempt but successfully acquired on a retry
+				await Task.Delay(TimeSpan.FromSeconds(1.99));
+
+				tasks.Add(Task.Run(() => ContendedSleep(redisLockFactory, resource, 2, TimeSpan.FromSeconds(2))));
+
+				await Task.WhenAll(tasks);
+			}
+		}
+
+		private async Task ContendedSleep(RedLockFactory redisLockFactory, string resource, int i, TimeSpan duration)
+		{
+			logger.LogInformation("Starting task {i}", i);
+
+			IRedLock redlock;
+			var acquired = false;
+			await using (redlock = await redisLockFactory.CreateLockAsync(resource, duration))
+			{
+				if (redlock.IsAcquired)
+				{
+					acquired = true;
+					await Task.Delay(duration);
+				}
+			}
+
+			logger.LogInformation("Ending task {i}, acquired: {acquired}, extendCount: {extendCount}", i, acquired, redlock.ExtendCount);
+
+			Assert.That(acquired, Is.True);
+			Assert.That(redlock.ExtendCount, Is.GreaterThanOrEqualTo(1));
 		}
 
 		[Test]
@@ -374,6 +427,22 @@ namespace RedLockNet.Tests
 		}
 
 		[Test]
+		[Ignore("Requires a redis server that supports SSL and TLS 1.2")]
+		public void TestSslWithProtocolConnection()
+		{
+			var endPoint = new RedLockEndPoint
+			{
+				EndPoint = new DnsEndPoint("localhost", 6383),
+				Ssl = true,
+				SslProtocols = SslProtocols.Tls12
+			};
+
+			CheckSingleRedisLock(
+				() => RedLockFactory.Create(new List<RedLockEndPoint> { endPoint }, loggerFactory),
+				RedLockStatus.Acquired);
+		}
+
+		[Test]
 		public void TestNonDefaultRedisDatabases()
 		{
 			CheckSingleRedisLock(
@@ -402,7 +471,21 @@ namespace RedLockNet.Tests
 				}
 			}
 		}
-		
+
+		private static async Task CheckSingleRedisLockAsync([InstantHandle]Func<RedLockFactory> factoryBuilder, RedLockStatus expectedStatus)
+		{
+			using (var redisLockFactory = factoryBuilder())
+			{
+				var resource = $"testredislock:{Guid.NewGuid()}";
+
+				await using (var redisLock = await redisLockFactory.CreateLockAsync(resource, TimeSpan.FromSeconds(30)))
+				{
+					Assert.That(redisLock.IsAcquired, Is.EqualTo(expectedStatus == RedLockStatus.Acquired));
+					Assert.That(redisLock.Status, Is.EqualTo(expectedStatus));
+				}
+			}
+		}
+
 		[Test]
 		public void TestCancelBlockingLock()
 		{
@@ -483,7 +566,7 @@ namespace RedLockNet.Tests
 				// warmup
 				for (var i = 0; i < 10; i++)
 				{
-					using (await redisLockFactory.CreateLockAsync(resource, TimeSpan.FromSeconds(30)))
+					await using (await redisLockFactory.CreateLockAsync(resource, TimeSpan.FromSeconds(30)))
 					{
 					}
 				}
@@ -497,7 +580,7 @@ namespace RedLockNet.Tests
 				{
 					sw.Restart();
 
-					using (var redisLock = await redisLockFactory.CreateLockAsync(resource, TimeSpan.FromSeconds(30)))
+					await using (var redisLock = await redisLockFactory.CreateLockAsync(resource, TimeSpan.FromSeconds(30)))
 					{
 						sw.Stop();
 

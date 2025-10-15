@@ -7,6 +7,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
+using RedLockNet.SERedis.Configuration;
 using RedLockNet.SERedis.Internal;
 using RedLockNet.SERedis.Util;
 using StackExchange.Redis;
@@ -16,6 +17,8 @@ namespace RedLockNet.SERedis
 	public class RedLock : IRedLock
 	{
 		private readonly object lockObject = new object();
+		private readonly SemaphoreSlim extendUnlockSemaphore = new SemaphoreSlim(1, 1);
+		private readonly CancellationTokenSource unlockCancellationTokenSource = new CancellationTokenSource();  
 
 		private readonly ICollection<RedisConnection> redisCaches;
 		private readonly ILogger<RedLock> logger;
@@ -23,7 +26,8 @@ namespace RedLockNet.SERedis
 		private readonly int quorum;
 		private readonly int quorumRetryCount;
 		private readonly int quorumRetryDelayMs;
-		private readonly double clockDriftFactor;
+		private const double ClockDriftFactor = 0.01;
+		private static readonly long ClockPrecisionPaddingTicks = TimeSpan.FromMilliseconds(2).Ticks;
 		private bool isDisposed;
 
 		private Timer lockKeepaliveTimer;
@@ -46,8 +50,11 @@ namespace RedLockNet.SERedis
 		private readonly TimeSpan? retryTime;
 		private CancellationToken cancellationToken;
 
-		private readonly TimeSpan minimumExpiryTime = TimeSpan.FromMilliseconds(10);
-		private readonly TimeSpan minimumRetryTime = TimeSpan.FromMilliseconds(10);
+		private static readonly TimeSpan MinimumExpiryTime = TimeSpan.FromMilliseconds(10);
+		private static readonly TimeSpan MinimumRetryTime = TimeSpan.FromMilliseconds(10);
+
+		private const int DefaultQuorumRetryCount = 3;
+		private const int DefaultQuorumRetryDelayMs = 400;
 
 		private RedLock(
 			ILogger<RedLock> logger,
@@ -56,28 +63,28 @@ namespace RedLockNet.SERedis
 			TimeSpan expiryTime,
 			TimeSpan? waitTime = null,
 			TimeSpan? retryTime = null,
+			RedLockRetryConfiguration retryConfiguration = null,
 			CancellationToken? cancellationToken = null)
 		{
 			this.logger = logger;
 
-			if (expiryTime < minimumExpiryTime)
+			if (expiryTime < MinimumExpiryTime)
 			{
-				logger.LogWarning($"Expiry time {expiryTime.TotalMilliseconds}ms too low, setting to {minimumExpiryTime.TotalMilliseconds}ms");
-				expiryTime = minimumExpiryTime;
+				logger.LogWarning($"Expiry time {expiryTime.TotalMilliseconds}ms too low, setting to {MinimumExpiryTime.TotalMilliseconds}ms");
+				expiryTime = MinimumExpiryTime;
 			}
 
-			if (retryTime != null && retryTime.Value < minimumRetryTime)
+			if (retryTime != null && retryTime.Value < MinimumRetryTime)
 			{
-				logger.LogWarning($"Retry time {retryTime.Value.TotalMilliseconds}ms too low, setting to {minimumRetryTime.TotalMilliseconds}ms");
-				retryTime = minimumRetryTime;
+				logger.LogWarning($"Retry time {retryTime.Value.TotalMilliseconds}ms too low, setting to {MinimumRetryTime.TotalMilliseconds}ms");
+				retryTime = MinimumRetryTime;
 			}
 
 			this.redisCaches = redisCaches;
 
 			quorum = redisCaches.Count / 2 + 1;
-			quorumRetryCount = 3;
-			quorumRetryDelayMs = 400;
-			clockDriftFactor = 0.01;
+			quorumRetryCount = retryConfiguration?.RetryCount ?? DefaultQuorumRetryCount;
+			quorumRetryDelayMs = retryConfiguration?.RetryDelayMs ?? DefaultQuorumRetryDelayMs;
 
 			Resource = resource;
 			LockId = Guid.NewGuid().ToString();
@@ -94,6 +101,7 @@ namespace RedLockNet.SERedis
 			TimeSpan expiryTime,
 			TimeSpan? waitTime = null,
 			TimeSpan? retryTime = null,
+			RedLockRetryConfiguration retryConfiguration = null,
 			CancellationToken? cancellationToken = null)
 		{
 			var redisLock = new RedLock(
@@ -103,6 +111,7 @@ namespace RedLockNet.SERedis
 				expiryTime,
 				waitTime,
 				retryTime,
+				retryConfiguration,
 				cancellationToken);
 
 			redisLock.Start();
@@ -117,6 +126,7 @@ namespace RedLockNet.SERedis
 			TimeSpan expiryTime,
 			TimeSpan? waitTime = null,
 			TimeSpan? retryTime = null,
+			RedLockRetryConfiguration retryConfiguration = null,
 			CancellationToken? cancellationToken = null)
 		{
 			var redisLock = new RedLock(
@@ -126,6 +136,7 @@ namespace RedLockNet.SERedis
 				expiryTime,
 				waitTime,
 				retryTime,
+				retryConfiguration,
 				cancellationToken);
 
 			await redisLock.StartAsync().ConfigureAwait(false);
@@ -294,51 +305,76 @@ namespace RedLockNet.SERedis
 			logger.LogDebug($"Starting auto extend timer with {interval}ms interval");
 
 			lockKeepaliveTimer = new Timer(
-				state =>
-				{
-					try
-					{
-						logger.LogTrace($"Lock renewal timer fired: {Resource} ({LockId})");
-
-						var stopwatch = Stopwatch.StartNew();
-
-						var extendSummary = Extend();
-
-						var validityTicks = GetRemainingValidityTicks(stopwatch);
-
-						if (extendSummary.Acquired >= quorum && validityTicks > 0)
-						{
-							Status = RedLockStatus.Acquired;
-							InstanceSummary = extendSummary;
-							ExtendCount++;
-
-							logger.LogDebug($"Extended lock, {Status} ({InstanceSummary}): {Resource} ({LockId})");
-						}
-						else
-						{
-							Status = GetFailedRedLockStatus(extendSummary);
-							InstanceSummary = extendSummary;
-
-							logger.LogWarning($"Failed to extend lock, {Status} ({InstanceSummary}): {Resource} ({LockId})");
-						}
-					}
-					catch (Exception exception)
-					{
-						// All we can do here is log the exception and swallow it.
-						var message = $"Lock renewal timer thread failed: {Resource} ({LockId})";
-						logger.LogError(null, exception, message);
-					}
-				},
+				state => { ExtendLockLifetime(); },
 				null,
 				(int) interval,
 				(int) interval);
+		}
+		
+		private void ExtendLockLifetime()
+		{
+			try
+			{
+				var gotSemaphore = extendUnlockSemaphore.Wait(0, unlockCancellationTokenSource.Token);
+				try
+				{
+					if (!gotSemaphore)
+					{
+						// another extend operation is still running, so skip this one
+						logger.LogWarning($"Lock renewal skipped due to another renewal still running: {Resource} ({LockId})");
+						return;
+					}
+
+					logger.LogTrace($"Lock renewal timer fired: {Resource} ({LockId})");
+
+					var stopwatch = Stopwatch.StartNew();
+
+					var extendSummary = Extend();
+
+					var validityTicks = GetRemainingValidityTicks(stopwatch);
+
+					if (extendSummary.Acquired >= quorum && validityTicks > 0)
+					{
+						Status = RedLockStatus.Acquired;
+						InstanceSummary = extendSummary;
+						ExtendCount++;
+
+						logger.LogDebug($"Extended lock, {Status} ({InstanceSummary}): {Resource} ({LockId})");
+					}
+					else
+					{
+						Status = GetFailedRedLockStatus(extendSummary);
+						InstanceSummary = extendSummary;
+
+						logger.LogWarning($"Failed to extend lock, {Status} ({InstanceSummary}): {Resource} ({LockId})");
+					}
+				}
+				catch (Exception exception)
+				{
+					// All we can do here is log the exception and swallow it.
+					var message = $"Lock renewal timer thread failed: {Resource} ({LockId})";
+					logger.LogError(null, exception, message);
+				}
+				finally
+				{
+					if (gotSemaphore)
+					{
+						extendUnlockSemaphore.Release();
+					}
+				}
+			}
+			catch (OperationCanceledException)
+			{
+				// unlock has been called, don't extend
+				logger.LogDebug($"Lock renewal cancelled: {Resource} ({LockId})");
+			}
 		}
 
 		private long GetRemainingValidityTicks(Stopwatch sw)
 		{
 			// Add 2 milliseconds to the drift to account for Redis expires precision,
 			// which is 1 milliescond, plus 1 millisecond min drift for small TTLs.
-			var driftTicks = (long) (expiryTime.Ticks * clockDriftFactor) + TimeSpan.FromMilliseconds(2).Ticks;
+			var driftTicks = (long) (expiryTime.Ticks * ClockDriftFactor) + ClockPrecisionPaddingTicks;
 			var validityTicks = expiryTime.Ticks - sw.Elapsed.Ticks - driftTicks;
 			return validityTicks;
 		}
@@ -378,14 +414,32 @@ namespace RedLockNet.SERedis
 
 		private void Unlock()
 		{
-			Parallel.ForEach(redisCaches, UnlockInstance);
+			// ReSharper disable once MethodSupportsCancellation
+			extendUnlockSemaphore.Wait();
+			try
+			{
+				Parallel.ForEach(redisCaches, UnlockInstance);
+			}
+			finally
+			{
+				extendUnlockSemaphore.Release();
+			}
 		}
 
 		private async Task UnlockAsync()
 		{
-			var unlockTasks = redisCaches.Select(UnlockInstanceAsync);
+			// ReSharper disable once MethodSupportsCancellation
+			await extendUnlockSemaphore.WaitAsync().ConfigureAwait(false);
+			try
+			{
+				var unlockTasks = redisCaches.Select(UnlockInstanceAsync);
 
-			await TaskUtils.WhenAll(unlockTasks).ConfigureAwait(false);
+				await TaskUtils.WhenAll(unlockTasks).ConfigureAwait(false);
+			}
+			finally
+			{
+				extendUnlockSemaphore.Release();
+			}
 		}
 
 		private RedLockInstanceResult LockInstance(RedisConnection cache)
@@ -476,7 +530,7 @@ namespace RedLockNet.SERedis
 
 			return result;
 		}
-
+		
 		private void UnlockInstance(RedisConnection cache)
 		{
 			var redisKey = GetRedisKey(cache.RedisKeyFormat, Resource);
@@ -544,7 +598,12 @@ namespace RedLockNet.SERedis
 				result.Append("), ");
 			}
 
-			return result.ToString().TrimEnd(' ', ',');
+			if (result.Length >= 2)
+			{
+				result.Remove(result.Length - 2, 2);
+			}
+
+			return result.ToString();
 		}
 
 		public void Dispose()
@@ -563,18 +622,39 @@ namespace RedLockNet.SERedis
 
 			if (disposing)
 			{
-				lock (lockObject)
-				{
-					if (lockKeepaliveTimer != null)
-					{
-						lockKeepaliveTimer.Change(Timeout.Infinite, Timeout.Infinite);
-						lockKeepaliveTimer.Dispose();
-						lockKeepaliveTimer = null;
-					}
-				}
+				StopKeepAliveTimer();
 			}
 
+			unlockCancellationTokenSource.Cancel();
 			Unlock();
+
+			Status = RedLockStatus.Unlocked;
+			InstanceSummary = new RedLockInstanceSummary();
+
+			isDisposed = true;
+		}
+
+		public ValueTask DisposeAsync()
+		{
+			return DisposeAsync(true);
+		}
+
+		protected virtual async ValueTask DisposeAsync(bool disposing)
+		{
+			logger.LogDebug($"Disposing {Resource} ({LockId})");
+
+			if (isDisposed)
+			{
+				return;
+			}
+
+			if (disposing)
+			{
+				StopKeepAliveTimer();
+			}
+
+			unlockCancellationTokenSource.Cancel();
+			await UnlockAsync().ConfigureAwait(false);
 
 			Status = RedLockStatus.Unlocked;
 			InstanceSummary = new RedLockInstanceSummary();
@@ -624,19 +704,17 @@ namespace RedLockNet.SERedis
 			return new RedLockInstanceSummary(acquired, conflicted, error);
 		}
 
-		/// <summary>
-		/// For unit tests only, do not use in normal operation
-		/// </summary>
 		internal void StopKeepAliveTimer()
 		{
-			if (lockKeepaliveTimer == null)
+			lock (lockObject)
 			{
-				return;
+				if (lockKeepaliveTimer != null)
+				{
+					lockKeepaliveTimer.Change(Timeout.Infinite, Timeout.Infinite);
+					lockKeepaliveTimer.Dispose();
+					lockKeepaliveTimer = null;
+				}
 			}
-
-			logger.LogDebug("Stopping auto extend timer");
-
-			lockKeepaliveTimer.Change(Timeout.Infinite, Timeout.Infinite);
 		}
 	}
 }
